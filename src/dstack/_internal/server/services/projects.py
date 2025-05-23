@@ -2,7 +2,7 @@ import uuid
 from datetime import timezone
 from typing import Awaitable, Callable, List, Optional, Tuple
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy import func as safunc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -199,6 +199,62 @@ async def set_project_members(
             commit=False,
         )
     await session.commit()
+
+
+async def add_member_to_project(
+    session: AsyncSession,
+    user: UserModel,
+    project: ProjectModel,
+    member: MemberSetting,
+) -> MemberModel:
+    project_role = get_user_project_role(user=user, project=project)
+    if member.project_role == ProjectRole.ADMIN:
+        if user.global_role != GlobalRole.ADMIN and project_role != ProjectRole.ADMIN:
+            raise ForbiddenError("Access denied: changing project admins")
+    if member.project_role == ProjectRole.MANAGER:
+        if user.global_role != GlobalRole.ADMIN and project_role != ProjectRole.MANAGER:
+            raise ForbiddenError("Access denied: changing project admins")
+
+    user_to_add = (
+        await session.execute(select(UserModel).filter(UserModel.name == member.username))
+    ).scalar_one_or_none()
+    if user_to_add is None:
+        raise ServerClientError("User does not exist")
+
+    already_member = (
+        await session.execute(
+            select(MemberModel).filter(
+                MemberModel.user_id == user_to_add.id, MemberModel.project_id == project.id
+            )
+        )
+    ).scalar_one_or_none()
+    if already_member is not None and already_member.project_role == member.project_role:
+        raise ServerClientError(f"{member.username} is already a member of the project")
+
+    if already_member and already_member.project_role != member.project_role:
+        await session.execute(
+            update(MemberModel)
+            .filter(MemberModel.user_id == user_to_add.id, MemberModel.project_id == project.id)
+            .values(project_role=member.project_role)
+        )
+        await session.commit()
+    else:
+        newest_member_num = (
+            await session.execute(
+                select(func.max(MemberModel.member_num)).where(
+                    MemberModel.project_id == project.id
+                )
+            )
+        ).scalar_one_or_none() or 0
+
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user_to_add,
+            project_role=member.project_role,
+            member_num=newest_member_num + 1,
+            commit=False,
+        )
 
 
 async def add_project_member(

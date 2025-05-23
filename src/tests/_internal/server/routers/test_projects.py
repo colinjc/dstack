@@ -657,3 +657,345 @@ class TestSetProjectMembers:
             json=body,
         )
         assert response.status_code == 403
+
+
+class TestAddMember:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+        response = await client.post("/api/projects/test_project/add_member")
+        assert response.status_code in [401, 403]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_403_if_project_does_not_exist(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session)
+        response = await client.post(
+            "/api/projects/nonexistent/add_member",
+            headers=get_auth_headers(user.token),
+            json={"username": "test_user", "project_role": ProjectRole.USER},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_adds_member_as_admin(self, test_db, session: AsyncSession, client: AsyncClient):
+        project = await create_project(
+            session=session,
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+        )
+        admin = await create_user(
+            session=session,
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+        )
+        await add_project_member(
+            session=session,
+            project=project,
+            user=admin,
+            project_role=ProjectRole.ADMIN,
+        )
+        new_user = await create_user(
+            session=session,
+            name="new_user",
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+        )
+
+        body = {"username": new_user.name, "project_role": ProjectRole.USER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(admin.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+
+        # Verify the response includes the new member
+        members = response.json()["members"]
+        assert len(members) == 2
+
+        # Find the new member in the response
+        new_member = next((m for m in members if m["user"]["username"] == new_user.name), None)
+        assert new_member is not None
+        assert new_member["project_role"] == ProjectRole.USER
+        assert new_member["user"]["id"] == str(new_user.id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_updates_existing_member_role(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        admin = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=admin,
+            project_role=ProjectRole.ADMIN,
+        )
+        existing_user = await create_user(session=session, name="existing_user")
+        await add_project_member(
+            session=session,
+            project=project,
+            user=existing_user,
+            project_role=ProjectRole.USER,
+        )
+
+        # Update the existing user's role to MANAGER
+        body = {"username": existing_user.name, "project_role": ProjectRole.MANAGER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(admin.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+
+        # Verify the role was updated
+        members = response.json()["members"]
+        updated_member = next(
+            (m for m in members if m["user"]["username"] == existing_user.name), None
+        )
+        assert updated_member is not None
+        assert updated_member["project_role"] == ProjectRole.MANAGER
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_if_user_does_not_exist(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        admin = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=admin,
+            project_role=ProjectRole.ADMIN,
+        )
+
+        body = {"username": "nonexistent_user", "project_role": ProjectRole.USER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(admin.token),
+            json=body,
+        )
+        assert response.status_code == 400
+        assert "User does not exist" in response.json()["detail"][0]["msg"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_if_user_already_member_with_same_role(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        admin = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=admin,
+            project_role=ProjectRole.ADMIN,
+        )
+        existing_user = await create_user(session=session, name="existing_user")
+        await add_project_member(
+            session=session,
+            project=project,
+            user=existing_user,
+            project_role=ProjectRole.USER,
+        )
+
+        # Try to add the same user with the same role
+        body = {"username": existing_user.name, "project_role": ProjectRole.USER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(admin.token),
+            json=body,
+        )
+        assert response.status_code == 400
+        assert "is already a member of the project" in response.json()["detail"][0]["msg"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_403_if_not_project_manager(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        regular_user = await create_user(session=session, global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=regular_user,
+            project_role=ProjectRole.USER,
+        )
+        new_user = await create_user(session=session, name="new_user")
+
+        body = {"username": new_user.name, "project_role": ProjectRole.USER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(regular_user.token),
+            json=body,
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_manager_cannot_add_admin(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        manager = await create_user(session=session, global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=manager,
+            project_role=ProjectRole.MANAGER,
+        )
+        new_user = await create_user(session=session, name="new_user")
+
+        body = {"username": new_user.name, "project_role": ProjectRole.ADMIN}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(manager.token),
+            json=body,
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_manager_can_add_manager(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        manager = await create_user(session=session, global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=manager,
+            project_role=ProjectRole.MANAGER,
+        )
+        new_user = await create_user(session=session, name="new_user")
+
+        body = {"username": new_user.name, "project_role": ProjectRole.MANAGER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(manager.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+
+        # Verify the new manager was added
+        members = response.json()["members"]
+        new_member = next((m for m in members if m["user"]["username"] == new_user.name), None)
+        assert new_member is not None
+        assert new_member["project_role"] == ProjectRole.MANAGER
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_global_admin_can_add_admin_as_manager(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        global_admin = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=global_admin,
+            project_role=ProjectRole.MANAGER,
+        )
+        new_user = await create_user(session=session, name="new_user")
+
+        body = {"username": new_user.name, "project_role": ProjectRole.ADMIN}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(global_admin.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+
+        # Verify the new admin was added
+        members = response.json()["members"]
+        new_member = next((m for m in members if m["user"]["username"] == new_user.name), None)
+        assert new_member is not None
+        assert new_member["project_role"] == ProjectRole.ADMIN
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_global_admin_can_add_manager_as_manager(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        global_admin = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=global_admin,
+            project_role=ProjectRole.MANAGER,
+        )
+        new_user = await create_user(session=session, name="new_user")
+
+        body = {"username": new_user.name, "project_role": ProjectRole.MANAGER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(global_admin.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+
+        # Verify the new manager was added
+        members = response.json()["members"]
+        new_member = next((m for m in members if m["user"]["username"] == new_user.name), None)
+        assert new_member is not None
+        assert new_member["project_role"] == ProjectRole.MANAGER
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_preserves_member_order(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        project = await create_project(session=session)
+        admin = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=admin,
+            project_role=ProjectRole.ADMIN,
+            member_num=0,
+        )
+        user1 = await create_user(session=session, name="user1")
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user1,
+            project_role=ProjectRole.USER,
+            member_num=1,
+        )
+        user2 = await create_user(session=session, name="user2")
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user2,
+            project_role=ProjectRole.USER,
+            member_num=2,
+        )
+
+        # Add a new member
+        new_user = await create_user(session=session, name="new_user")
+        body = {"username": new_user.name, "project_role": ProjectRole.USER}
+        response = await client.post(
+            f"/api/projects/{project.name}/add_member",
+            headers=get_auth_headers(admin.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+
+        # Verify the new member is added at the end
+        members = response.json()["members"]
+        assert len(members) == 4
+        assert members[3]["user"]["username"] == new_user.name
+
+        # Verify member_num is correctly set in the database
+        res = await session.execute(
+            select(MemberModel).where(
+                MemberModel.project_id == project.id, MemberModel.user_id == new_user.id
+            )
+        )
+        new_member_model = res.scalar_one()
+        assert new_member_model.member_num == 3

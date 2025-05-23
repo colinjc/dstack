@@ -9,6 +9,7 @@ from dstack._internal.server.models import ProjectModel, UserModel
 from dstack._internal.server.schemas.projects import (
     CreateProjectRequest,
     DeleteProjectsRequest,
+    MemberSetting,
     SetProjectMembersRequest,
 )
 from dstack._internal.server.security.permissions import (
@@ -17,7 +18,9 @@ from dstack._internal.server.security.permissions import (
     ProjectMember,
 )
 from dstack._internal.server.services import projects
-from dstack._internal.server.utils.routers import get_base_api_additional_responses
+from dstack._internal.server.utils.routers import (
+    get_base_api_additional_responses,
+)
 
 router = APIRouter(
     prefix="/api/projects",
@@ -88,6 +91,24 @@ async def set_project_members(
         user=user,
         project=project,
         members=body.members,
+    )
+    await session.refresh(project)
+    return projects.project_model_to_project(project)
+
+
+@router.post("/{project_name}/add_member")
+async def add_member(
+    body: MemberSetting,
+    session: AsyncSession = Depends(get_session),
+    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectManager()),
+) -> Project:
+    user, project = user_project
+
+    await projects.add_member_to_project(
+        session=session,
+        user=user,
+        project=project,
+        member=body,
     )
     await session.refresh(project)
     return projects.project_model_to_project(project)
